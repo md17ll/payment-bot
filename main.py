@@ -24,7 +24,7 @@ NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
 PORT = int(os.getenv("PORT", "8000"))
 
 PRICE_CURRENCY = "usd"
-PAY_CURRENCY = "usdt"  # We'll receive USDT (your account settlement should be set to USDT TRC20)
+PAY_CURRENCY = "usdt"  # Settlement should be set to USDT TRC20 in NOWPayments dashboard
 
 if not BOT_TOKEN or not ADMIN_ID or not NOWPAYMENTS_API_KEY or not NOWPAYMENTS_IPN_SECRET:
     raise RuntimeError("Missing environment variables. Check Railway Variables.")
@@ -32,10 +32,12 @@ if not BOT_TOKEN or not ADMIN_ID or not NOWPAYMENTS_API_KEY or not NOWPAYMENTS_I
 # ============ DB ============
 DB_PATH = "orders.db"
 
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     with db() as conn:
@@ -60,6 +62,7 @@ def init_db():
         )
         """)
 
+
 def create_order(chat_id: int, amount_usd: float) -> int:
     with db() as conn:
         cur = conn.execute(
@@ -68,6 +71,7 @@ def create_order(chat_id: int, amount_usd: float) -> int:
         )
         return cur.lastrowid
 
+
 def attach_invoice(order_id: int, invoice_id: str, invoice_url: str):
     with db() as conn:
         conn.execute(
@@ -75,14 +79,17 @@ def attach_invoice(order_id: int, invoice_id: str, invoice_url: str):
             (invoice_id, invoice_url, "invoice_created", order_id)
         )
 
+
 def set_order_status(order_id: int, status: str):
     with db() as conn:
         conn.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
+
 
 def get_order_by_invoice(invoice_id: str):
     with db() as conn:
         cur = conn.execute("SELECT * FROM orders WHERE invoice_id=?", (invoice_id,))
         return cur.fetchone()
+
 
 def upsert_payment(payment_id: str, order_id: int, status: str, raw: dict):
     with db() as conn:
@@ -95,8 +102,10 @@ def upsert_payment(payment_id: str, order_id: int, status: str, raw: dict):
             updated_at=excluded.updated_at
         """, (payment_id, order_id, status, json.dumps(raw, ensure_ascii=False), datetime.utcnow().isoformat()))
 
+
 # ============ NOWPayments ============
 NOWPAYMENTS_INVOICE_URL = "https://api.nowpayments.io/v1/invoice"
+
 
 def verify_nowpayments_signature(raw_body: bytes, signature: str | None) -> bool:
     """
@@ -119,6 +128,7 @@ def verify_nowpayments_signature(raw_body: bytes, signature: str | None) -> bool
 
     return hmac.compare_digest(digest, signature)
 
+
 async def create_invoice(amount_usd: float, order_id: int) -> dict:
     payload = {
         "price_amount": amount_usd,
@@ -126,9 +136,8 @@ async def create_invoice(amount_usd: float, order_id: int) -> dict:
         "pay_currency": PAY_CURRENCY,
         "order_id": str(order_id),
         "order_description": f"Order #{order_id}",
-        # Webhook is already set in your NOWPayments dashboard,
-        # but keeping this here is also fine. If they ignore it, no problem.
-        # "ipn_callback_url": "https://your-domain/ipn"
+        # Webhook is already set in your NOWPayments dashboard:
+        # https://payment-bot-production-548d.up.railway.app/ipn
     }
 
     headers = {
@@ -141,11 +150,13 @@ async def create_invoice(amount_usd: float, order_id: int) -> dict:
         r.raise_for_status()
         return r.json()
 
+
 # ============ FASTAPI (Webhook) ============
-api = FastAPI()
+app = FastAPI()
 tg_app: Application | None = None  # will be assigned later
 
-@api.post("/ipn")
+
+@app.post("/ipn")
 async def nowpayments_ipn(request: Request, x_nowpayments_sig: str | None = Header(default=None)):
     raw = await request.body()
 
@@ -180,15 +191,18 @@ async def nowpayments_ipn(request: Request, x_nowpayments_sig: str | None = Head
 
     return {"ok": True}
 
+
 # ============ TELEGRAM BOT ============
 def is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ADMIN_ID
+
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ هذا البوت خاص بالإدارة فقط")
         return
     await update.message.reply_text("✅ البوت شغال.\nاستخدم: /pay 5")
+
 
 async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
@@ -212,7 +226,6 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         inv = await create_invoice(amount, order_id)
 
-        # NOWPayments invoice response usually contains: id + invoice_url
         invoice_id = str(inv.get("id") or inv.get("invoice_id") or "")
         invoice_url = inv.get("invoice_url") or inv.get("payment_url") or ""
 
@@ -239,11 +252,13 @@ async def pay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_order_status(order_id, "invoice_exception")
         await update.message.reply_text(f"❌ خطأ غير متوقع: {str(e)}")
 
+
 # ============ RUN BOTH (WEB + BOT) ============
 async def run_web():
-    config = uvicorn.Config(api, host="0.0.0.0", port=PORT, log_level="info")
+    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info")
     server = uvicorn.Server(config)
     await server.serve()
+
 
 async def run_bot():
     global tg_app
@@ -254,12 +269,13 @@ async def run_bot():
     await tg_app.initialize()
     await tg_app.start()
     await tg_app.updater.start_polling()
-    # keep running
-    await asyncio.Event().wait()
+    await asyncio.Event().wait()  # keep running
+
 
 async def main():
     init_db()
     await asyncio.gather(run_web(), run_bot())
+
 
 if __name__ == "__main__":
     asyncio.run(main())
