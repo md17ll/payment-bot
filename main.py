@@ -4,7 +4,6 @@ import hmac
 import hashlib
 import sqlite3
 import threading
-import asyncio
 from datetime import datetime
 
 import httpx
@@ -28,10 +27,11 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "")
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
 
-PORT = int(os.getenv("PORT", "8000"))
+# خليها من Variables إذا بدك (افضل)
+PRICE_CURRENCY = os.getenv("PRICE_CURRENCY", "usd")
+PAY_CURRENCY = os.getenv("PAY_CURRENCY", "usdttrc20")
 
-PRICE_CURRENCY = "usd"
-PAY_CURRENCY = "usdttrc20"
+PORT = int(os.getenv("PORT", "8000"))
 
 if not BOT_TOKEN or not ADMIN_ID or not NOWPAYMENTS_API_KEY or not NOWPAYMENTS_IPN_SECRET:
     raise RuntimeError("Missing env vars. Check Railway Variables.")
@@ -86,6 +86,11 @@ def set_order_status(order_id: int, status: str):
     with db() as conn:
         conn.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
 
+def get_order(order_id: int):
+    with db() as conn:
+        cur = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,))
+        return cur.fetchone()
+
 def get_order_by_invoice(invoice_id: str):
     with db() as conn:
         cur = conn.execute("SELECT * FROM orders WHERE invoice_id=?", (invoice_id,))
@@ -101,6 +106,31 @@ def upsert_payment(payment_id: str, order_id: int, status: str, raw: dict):
             raw_json=excluded.raw_json,
             updated_at=excluded.updated_at
         """, (payment_id, order_id, status, json.dumps(raw, ensure_ascii=False), datetime.utcnow().isoformat()))
+
+def stats_summary():
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) c FROM orders").fetchone()["c"]
+        paid = conn.execute("""
+            SELECT COUNT(*) c FROM orders
+            WHERE lower(status) IN ('confirmed','finished')
+        """).fetchone()["c"]
+        pending = conn.execute("""
+            SELECT COUNT(*) c FROM orders
+            WHERE lower(status) NOT IN ('confirmed','finished')
+        """).fetchone()["c"]
+        sum_all = conn.execute("SELECT COALESCE(SUM(amount_usd),0) s FROM orders").fetchone()["s"]
+        sum_paid = conn.execute("""
+            SELECT COALESCE(SUM(amount_usd),0) s FROM orders
+            WHERE lower(status) IN ('confirmed','finished')
+        """).fetchone()["s"]
+
+    return {
+        "total": total,
+        "paid": paid,
+        "pending": pending,
+        "sum_all": float(sum_all),
+        "sum_paid": float(sum_paid),
+    }
 
 # ================== NOWPayments ==================
 NOWPAYMENTS_INVOICE_URL = "https://api.nowpayments.io/v1/invoice"
@@ -165,6 +195,7 @@ async def nowpayments_ipn(request: Request, x_nowpayments_sig: str | None = Head
         upsert_payment(payment_id, int(order["id"]), status, data)
         set_order_status(int(order["id"]), status)
 
+        # إشعار للأدمن فقط عند الدفع النهائي
         if tg_app and status in {"confirmed", "finished"}:
             await tg_app.bot.send_message(
                 chat_id=ADMIN_ID,
@@ -181,31 +212,25 @@ async def nowpayments_ipn(request: Request, x_nowpayments_sig: str | None = Head
 def run_uvicorn():
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
 
-# ================== TELEGRAM (Buttons) ==================
+# ================== TELEGRAM (Admin only) ==================
 def is_admin(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ADMIN_ID
 
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💳 إنشاء رابط دفع", callback_data="mkpay")],
+        [InlineKeyboardButton("💳 إنشاء رابط دفع (مخصص)", callback_data="mkpay_custom")],
+        [InlineKeyboardButton("📦 حالة الطلب", callback_data="order_status")],
+        [InlineKeyboardButton("📊 إحصائيات", callback_data="stats")],
         [InlineKeyboardButton("ℹ️ مساعدة", callback_data="help")],
-    ])
-
-def pay_menu():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("5$", callback_data="pay:5"),
-            InlineKeyboardButton("10$", callback_data="pay:10"),
-            InlineKeyboardButton("20$", callback_data="pay:20"),
-        ],
-        [InlineKeyboardButton("✍️ مبلغ مخصص", callback_data="pay:custom")],
-        [InlineKeyboardButton("⬅️ رجوع", callback_data="back")],
     ])
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         await update.message.reply_text("❌ هذا البوت خاص بالإدارة فقط")
         return
+    # تنظيف أي حالات انتظار
+    context.user_data.pop("await_amount", None)
+    context.user_data.pop("await_order_id", None)
     await update.message.reply_text("✅ أهلاً أدمن. اختر من الأزرار:", reply_markup=main_menu())
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,60 +243,100 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = q.data
 
-    if data == "mkpay":
-        context.user_data.pop("await_amount", None)
-        await q.edit_message_text("اختر مبلغ:", reply_markup=pay_menu())
+    if data == "mkpay_custom":
+        context.user_data["await_amount"] = True
+        context.user_data.pop("await_order_id", None)
+        await q.edit_message_text("✍️ اكتب المبلغ بالدولار (مثال: 5 أو 12.5)\n\n(للإلغاء اكتب: cancel)")
         return
 
-    if data == "help":
+    if data == "order_status":
+        context.user_data["await_order_id"] = True
+        context.user_data.pop("await_amount", None)
+        await q.edit_message_text("📦 اكتب رقم الطلب (Order ID)\n\n(للإلغاء اكتب: cancel)")
+        return
+
+    if data == "stats":
+        s = stats_summary()
         await q.edit_message_text(
-            "📌 الاستخدام:\n"
-            "- اضغط 💳 إنشاء رابط دفع\n"
-            "- اختر مبلغ أو مبلغ مخصص\n"
-            "- يطلع لك رابط ترسله للزبون\n\n"
-            "🔔 عند اكتمال الدفع سيصلك إشعار تلقائيًا.",
+            "📊 إحصائيات:\n"
+            f"- إجمالي الطلبات: {s['total']}\n"
+            f"- طلبات مدفوعة: {s['paid']}\n"
+            f"- طلبات غير مدفوعة/قيد المعالجة: {s['pending']}\n"
+            f"- مجموع كل الطلبات: {s['sum_all']:.2f} USD\n"
+            f"- مجموع المدفوع: {s['sum_paid']:.2f} USD\n",
             reply_markup=main_menu()
         )
         return
 
-    if data == "back":
-        context.user_data.pop("await_amount", None)
-        await q.edit_message_text("القائمة الرئيسية:", reply_markup=main_menu())
+    if data == "help":
+        await q.edit_message_text(
+            "ℹ️ شرح سريع:\n"
+            "1) 💳 إنشاء رابط دفع (مخصص) → اكتب مبلغ بالدولار\n"
+            "2) 📦 حالة الطلب → اكتب رقم الطلب\n"
+            "3) 📊 إحصائيات → عرض ملخص الطلبات\n\n"
+            "🔔 عند اكتمال الدفع (confirmed/finished) يصلك إشعار تلقائيًا.",
+            reply_markup=main_menu()
+        )
         return
-
-    if data.startswith("pay:"):
-        val = data.split(":", 1)[1]
-        if val == "custom":
-            context.user_data["await_amount"] = True
-            await q.edit_message_text("✍️ اكتب المبلغ بالدولار (مثال: 5 أو 12.5)")
-            return
-        else:
-            amount = float(val)
-            await q.edit_message_text("⏳ جاري إنشاء رابط الدفع...")
-            await make_payment_link(q.message.chat_id, amount, context, q)
-            return
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
 
-    if not context.user_data.get("await_amount"):
+    text = (update.message.text or "").strip()
+
+    # إلغاء أي وضع انتظار
+    if text.lower() in {"cancel", "c", "stop"}:
+        context.user_data.pop("await_amount", None)
+        context.user_data.pop("await_order_id", None)
+        await update.message.reply_text("✅ تم الإلغاء.", reply_markup=main_menu())
         return
 
-    txt = (update.message.text or "").strip().replace(",", ".")
-    try:
-        amount = float(txt)
-        if amount <= 0:
-            raise ValueError()
-    except Exception:
-        await update.message.reply_text("❌ اكتب رقم صحيح (مثال: 5 أو 12.5)")
+    # انتظار مبلغ لإنشاء رابط
+    if context.user_data.get("await_amount"):
+        cleaned = text.replace(",", ".")
+        try:
+            amount = float(cleaned)
+            if amount <= 0:
+                raise ValueError()
+        except Exception:
+            await update.message.reply_text("❌ اكتب رقم صحيح (مثال: 5 أو 12.5) أو اكتب cancel للإلغاء")
+            return
+
+        context.user_data["await_amount"] = False
+        await update.message.reply_text("⏳ جاري إنشاء رابط الدفع...")
+        await make_payment_link(update.message.chat_id, amount, context)
         return
 
-    context.user_data["await_amount"] = False
-    await update.message.reply_text("⏳ جاري إنشاء رابط الدفع...")
-    await make_payment_link(update.message.chat_id, amount, context, None)
+    # انتظار رقم طلب لعرض الحالة
+    if context.user_data.get("await_order_id"):
+        try:
+            oid = int(text)
+            if oid <= 0:
+                raise ValueError()
+        except Exception:
+            await update.message.reply_text("❌ اكتب رقم طلب صحيح (مثال: 12) أو cancel للإلغاء")
+            return
 
-async def make_payment_link(chat_id: int, amount: float, context: ContextTypes.DEFAULT_TYPE, q):
+        context.user_data["await_order_id"] = False
+        order = get_order(oid)
+        if not order:
+            await update.message.reply_text("❌ ما لقيت طلب بهذا الرقم.", reply_markup=main_menu())
+            return
+
+        status = (order["status"] or "unknown")
+        msg = (
+            f"📦 حالة الطلب #{order['id']}:\n"
+            f"- المبلغ: {order['amount_usd']} USD\n"
+            f"- الحالة: {status}\n"
+        )
+        if order["invoice_url"]:
+            msg += f"- رابط الدفع: {order['invoice_url']}\n"
+
+        await update.message.reply_text(msg, reply_markup=main_menu())
+        return
+
+async def make_payment_link(chat_id: int, amount: float, context: ContextTypes.DEFAULT_TYPE):
     order_id = create_order(chat_id=chat_id, amount_usd=amount)
     try:
         inv = await create_invoice(amount, order_id)
@@ -280,38 +345,34 @@ async def make_payment_link(chat_id: int, amount: float, context: ContextTypes.D
 
         if not invoice_id or not invoice_url:
             set_order_status(order_id, "invoice_error")
-            msg = f"❌ فشل إنشاء الفاتورة.\nالرد: {inv}"
-            if q:
-                await q.edit_message_text(msg, reply_markup=main_menu())
-            else:
-                await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=main_menu())
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ فشل إنشاء الفاتورة.\nالرد: {inv}",
+                reply_markup=main_menu()
+            )
             return
 
         attach_invoice(order_id, invoice_id, invoice_url)
 
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("ادفع الآن", url=invoice_url)]])
-        text = f"🧾 طلب #{order_id}\nالمبلغ: {amount} USD\n🔗 هذا رابط الدفع:"
-        if q:
-            await q.edit_message_text(text, reply_markup=kb)
-            await context.bot.send_message(chat_id=chat_id, text=invoice_url)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-            await context.bot.send_message(chat_id=chat_id, text=invoice_url)
+        text = f"🧾 طلب #{order_id}\nالمبلغ: {amount} USD\n🔗 رابط الدفع:"
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        await context.bot.send_message(chat_id=chat_id, text=invoice_url)
 
     except httpx.HTTPStatusError as e:
         set_order_status(order_id, "invoice_http_error")
-        msg = f"❌ خطأ من NOWPayments:\n{e.response.text}"
-        if q:
-            await q.edit_message_text(msg, reply_markup=main_menu())
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=main_menu())
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ خطأ من NOWPayments:\n{e.response.text}",
+            reply_markup=main_menu()
+        )
     except Exception as e:
         set_order_status(order_id, "invoice_exception")
-        msg = f"❌ خطأ غير متوقع: {str(e)}"
-        if q:
-            await q.edit_message_text(msg, reply_markup=main_menu())
-        else:
-            await context.bot.send_message(chat_id=chat_id, text=msg, reply_markup=main_menu())
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"❌ خطأ غير متوقع: {str(e)}",
+            reply_markup=main_menu()
+        )
 
 # ================== START ==================
 def main():
