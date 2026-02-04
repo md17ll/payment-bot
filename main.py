@@ -31,7 +31,7 @@ NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "")
 PORT = int(os.getenv("PORT", "8000"))
 
 PRICE_CURRENCY = "usd"
-PAY_CURRENCY = "usdt"
+PAY_CURRENCY = "usdttrc20"
 
 if not BOT_TOKEN or not ADMIN_ID or not NOWPAYMENTS_API_KEY or not NOWPAYMENTS_IPN_SECRET:
     raise RuntimeError("Missing env vars. Check Railway Variables.")
